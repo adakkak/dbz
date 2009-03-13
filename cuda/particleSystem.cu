@@ -27,223 +27,301 @@
  * source code with only those rights set forth herein.
  */
 
-// This file contains C wrappers around the some of the CUDA API and the
-// kernel functions so that they can be called from "particleSystem.cpp"
-
-#include <cutil_inline.h>
+#include <cutil.h>
 #include <cstdlib>
 #include <cstdio>
 #include <string.h>
-
-#if defined(__APPLE__) || defined(MACOSX)
-#include <GLUT/glut.h>
-#else
 #include <GL/glut.h>
-#endif
-
 #include <cuda_gl_interop.h>
 
+#include "particles_kernel.cuh"
 #include "particles_kernel.cu"
 #include "radixsort.cu"
 
 extern "C"
 {
 
-void cudaInit(int argc, char **argv)
+void checkCUDA()
 {   
-    // use command-line specified CUDA device, otherwise use device with highest Gflops/s
-    if( cutCheckCmdLineFlag(argc, (const char**)argv, "device") )
-        cutilDeviceInit(argc, argv);
-    else
-        cudaSetDevice( cutGetMaxGflopsDeviceId() );
+    CUT_DEVICE_INIT();
 }
 
 void allocateArray(void **devPtr, size_t size)
 {
-    cutilSafeCall(cudaMalloc(devPtr, size));
+    CUDA_SAFE_CALL(cudaMalloc(devPtr, size));
 }
 
 void freeArray(void *devPtr)
 {
-    cutilSafeCall(cudaFree(devPtr));
+    CUDA_SAFE_CALL(cudaFree(devPtr));
 }
 
 void threadSync()
 {
-    cutilSafeCall(cudaThreadSynchronize());
+    CUDA_SAFE_CALL(cudaThreadSynchronize());
 }
 
 void copyArrayFromDevice(void* host, const void* device, unsigned int vbo, int size)
 {   
     if (vbo)
-        cutilSafeCall(cudaGLMapBufferObject((void**)&device, vbo));
-
-    cutilSafeCall(cudaMemcpy(host, device, size, cudaMemcpyDeviceToHost));
-    
+        CUDA_SAFE_CALL(cudaGLMapBufferObject((void**)&device, vbo));
+    CUDA_SAFE_CALL(cudaMemcpy(host, device, size, cudaMemcpyDeviceToHost));
     if (vbo)
-        cutilSafeCall(cudaGLUnmapBufferObject(vbo));
+        CUDA_SAFE_CALL(cudaGLUnmapBufferObject(vbo));
 }
 
 void copyArrayToDevice(void* device, const void* host, int offset, int size)
 {
-    cutilSafeCall(cudaMemcpy((char *) device + offset, host, size, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy((char *) device + offset, host, size, cudaMemcpyHostToDevice));
 }
 
 void registerGLBufferObject(uint vbo)
 {
-    cutilSafeCall(cudaGLRegisterBufferObject(vbo));
+    CUDA_SAFE_CALL(cudaGLRegisterBufferObject(vbo));
 }
 
 void unregisterGLBufferObject(uint vbo)
 {
-    cutilSafeCall(cudaGLUnregisterBufferObject(vbo));
+    CUDA_SAFE_CALL(cudaGLUnregisterBufferObject(vbo));
 }
 
-void *mapGLBufferObject(uint vbo)
+void 
+integrateSystem(uint vboOldPos, uint vboNewPos, 
+                float* oldVel, float* newVel, 
+                float deltaTime,
+                float damping,
+                float particleRadius,
+                float gravity,
+                int numBodies)
 {
-    void *ptr;
-    cutilSafeCall(cudaGLMapBufferObject(&ptr, vbo));
-    return ptr;
-}
+    int numThreads = min(256, numBodies);
+    int numBlocks = (int) ceil(numBodies / (float) numThreads);
 
-void unmapGLBufferObject(uint vbo)
-{
-    cutilSafeCall(cudaGLUnmapBufferObject(vbo));
-}
-
-void setParameters(SimParams *hostParams)
-{
-    // copy parameters to constant memory
-    cutilSafeCall( cudaMemcpyToSymbol(params, hostParams, sizeof(SimParams)) );
-}
-
-//Round a / b to nearest higher integer value
-uint iDivUp(uint a, uint b){
-    return (a % b != 0) ? (a / b + 1) : (a / b);
-}
-
-// compute grid and thread block size for a given number of elements
-void computeGridSize(uint n, uint blockSize, uint &numBlocks, uint &numThreads)
-{
-    numThreads = min(blockSize, n);
-    numBlocks = iDivUp(n, numThreads);
-}
-
-void integrateSystem(float *pos,
-                     float *vel,
-                     float deltaTime,
-                     uint numParticles)
-{
-    uint numThreads, numBlocks;
-    computeGridSize(numParticles, 256, numBlocks, numThreads);
+    float *oldPos, *newPos;
+    CUDA_SAFE_CALL(cudaGLMapBufferObject((void**)&oldPos, vboOldPos));
+    CUDA_SAFE_CALL(cudaGLMapBufferObject((void**)&newPos, vboNewPos));
 
     // execute the kernel
-    integrate<<< numBlocks, numThreads >>>((float4*)pos,
-                                           (float4*)vel,
+    integrate<<< numBlocks, numThreads >>>((float4*)newPos, (float4*)newVel,
+                                           (float4*)oldPos, (float4*)oldVel,
                                            deltaTime,
-                                           numParticles);
+                                           damping,
+                                           particleRadius,
+                                           gravity
+                                           );
     
     // check if kernel invocation generated an error
-    cutilCheckMsg("integrate kernel execution failed");
+    CUT_CHECK_ERROR("Kernel execution failed");
+
+    CUDA_SAFE_CALL(cudaGLUnmapBufferObject(vboOldPos));
+    CUDA_SAFE_CALL(cudaGLUnmapBufferObject(vboNewPos));
 }
 
-void calcHash(uint*  particleHash,
-              float* pos, 
-              int    numParticles)
+void 
+updateGrid(uint    vboPos, 
+           uint*   gridCounters,
+           uint*   gridCells,
+           int     gridSize[3],
+           float   cellSize[3],
+           float   worldOrigin[3],
+           int     maxParticlesPerCell,
+           int     numBodies
+           )
 {
-    uint numThreads, numBlocks;
-    computeGridSize(numParticles, 256, numBlocks, numThreads);
+    int numThreads = min(256, numBodies);
+    int numBlocks = (int) ceil(numBodies / (float) numThreads);
+
+    float *pos;
+    CUDA_SAFE_CALL(cudaGLMapBufferObject((void**)&pos, vboPos));
+
+    CUDA_SAFE_CALL(cudaMemset(gridCounters, 0, gridSize[0]*gridSize[1]*gridSize[2]*sizeof(uint)));
 
     // execute the kernel
-    calcHashD<<< numBlocks, numThreads >>>((uint2 *) particleHash,
-                                           (float4 *) pos,
-                                           numParticles);
+    updateGridD<<< numBlocks, numThreads >>>((float4 *) pos,
+                                             gridCounters,
+                                             gridCells,
+                                             make_uint3(gridSize[0], gridSize[1], gridSize[2]),
+                                             make_float3(cellSize[0], cellSize[1], cellSize[2]),
+                                             make_float3(worldOrigin[0], worldOrigin[1], worldOrigin[2]),
+                                             maxParticlesPerCell
+                                             );
     
     // check if kernel invocation generated an error
-    cutilCheckMsg("Kernel execution failed");
+    CUT_CHECK_ERROR("Kernel execution failed");
+
+    CUDA_SAFE_CALL(cudaGLUnmapBufferObject(vboPos));
 }
 
-void reorderDataAndFindCellStart(uint*  cellStart,
-							     uint*  cellEnd,
-							     float* sortedPos,
-							     float* sortedVel,
-                                 uint*  particleHash,
-							     float* oldPos,
-							     float* oldVel,
-							     uint   numParticles,
-							     uint   numCells)
+
+void 
+calcHash(uint    vboPos, 
+         uint*   particleHash,
+         uint    gridSize[3],
+         float   cellSize[3],
+         float   worldOrigin[3],
+         int     numBodies
+         )
 {
-    uint numThreads, numBlocks;
-    computeGridSize(numParticles, 256, numBlocks, numThreads);
+    int numThreads = min(256, numBodies);
+    int numBlocks = (int) ceil(numBodies / (float) numThreads);
 
-    // set all cells to empty
-	cutilSafeCall(cudaMemset(cellStart, 0xffffffff, numCells*sizeof(uint)));
+    float *pos;
+    CUDA_SAFE_CALL(cudaGLMapBufferObject((void**)&pos, vboPos));
 
-#if USE_TEX
-    cutilSafeCall(cudaBindTexture(0, oldPosTex, oldPos, numParticles*sizeof(float4)));
-    cutilSafeCall(cudaBindTexture(0, oldVelTex, oldVel, numParticles*sizeof(float4)));
-#endif
+    // execute the kernel
+    calcHashD<<< numBlocks, numThreads >>>((float4 *) pos,
+                                           (uint2 *) particleHash,
+                                           make_uint3(gridSize[0], gridSize[1], gridSize[2]),
+                                           make_float3(cellSize[0], cellSize[1], cellSize[2]),
+                                           make_float3(worldOrigin[0], worldOrigin[1], worldOrigin[2])
+                                           );
+    
+    // check if kernel invocation generated an error
+    CUT_CHECK_ERROR("Kernel execution failed");
 
-    uint smemSize = sizeof(uint)*(numThreads+1);
-    reorderDataAndFindCellStartD<<< numBlocks, numThreads, smemSize>>>(
-        cellStart,
-        cellEnd,
-        (float4 *) sortedPos,
-        (float4 *) sortedVel,
-		(uint2 *)  particleHash,
-        (float4 *) oldPos,
-        (float4 *) oldVel,
-        numParticles);
-    cutilCheckMsg("Kernel execution failed: reorderDataAndFindCellStartD");
-
-#if USE_TEX
-    cutilSafeCall(cudaUnbindTexture(oldPosTex));
-    cutilSafeCall(cudaUnbindTexture(oldVelTex));
-#endif
+    CUDA_SAFE_CALL(cudaGLUnmapBufferObject(vboPos));
 }
 
-void collide(float* newVel,
-             float* sortedPos,
-             float* sortedVel,
-             uint*  particleHash,
-             uint*  cellStart,
-             uint*  cellEnd,
-             uint   numParticles,
-             uint   numCells)
+void 
+findCellStart(uint* particleHash,
+              uint* cellStart,
+              uint numBodies,
+              uint numGridCells)
 {
-#if USE_TEX
-    cutilSafeCall(cudaBindTexture(0, oldPosTex, sortedPos, numParticles*sizeof(float4)));
-    cutilSafeCall(cudaBindTexture(0, oldVelTex, sortedVel, numParticles*sizeof(float4)));
+    // scatter method
+    int numThreads = 256;
+    uint numBlocks = (uint) ceil(numBodies / (float) numThreads);
 
+    CUDA_SAFE_CALL(cudaMemset(cellStart, 0xffffffff, numGridCells*sizeof(uint)));
+
+    findCellStartD<<< numBlocks, numThreads >>>((uint2 *) particleHash,
+                                                cellStart,
+                                                numBodies,
+                                                numGridCells);
+}
+
+void 
+reorderData(uint* particleHash,
+            uint vboOldPos,
+            float* oldVel,
+            float* sortedPos,
+            float* sortedVel,
+            uint numBodies)
+{
+    int numThreads = 256;
+    uint numBlocks = (uint) ceil(numBodies / (float) numThreads);
+
+    float *oldPos;
+    CUDA_SAFE_CALL(cudaGLMapBufferObject((void**)&oldPos, vboOldPos));
+
+#if USE_TEX
+    CUDA_SAFE_CALL(cudaBindTexture(0, posTex, oldPos, numBodies*sizeof(float4)));
+    CUDA_SAFE_CALL(cudaBindTexture(0, velTex, oldVel, numBodies*sizeof(float4)));
+#endif
+
+    reorderDataD<<< numBlocks, numThreads >>>((uint2 *) particleHash,
+                                              (float4 *) oldPos,
+                                              (float4 *) oldVel,
+                                              (float4 *) sortedPos,
+                                              (float4 *) sortedVel);
+
+#if USE_TEX
+    CUDA_SAFE_CALL(cudaUnbindTexture(posTex));
+    CUDA_SAFE_CALL(cudaUnbindTexture(velTex));
+#endif
+
+    CUDA_SAFE_CALL(cudaGLUnmapBufferObject(vboOldPos));
+}
+
+void
+collide(uint    vboOldPos, uint vboNewPos,
+        float*  sortedPos, float* sortedVel,
+        float*  oldVel, float* newVel, 
+        uint*   gridCounters,
+        uint*   gridCells,
+        uint*   particleHash,
+        uint*   cellStart,
+        uint    gridSize[3],
+        float   cellSize[3],
+        float   worldOrigin[3],
+        int     maxParticlesPerCell,
+        float   particleRadius,
+        uint    numBodies,
+        float*  colliderPos,
+        float   colliderRadius,
+        float   spring,
+        float   damping,
+        float   sheer,
+        float   attraction
+        )
+{
+    float4 *oldPos, *newPos;
+    CUDA_SAFE_CALL(cudaGLMapBufferObject((void**)&oldPos, vboOldPos));
+    CUDA_SAFE_CALL(cudaGLMapBufferObject((void**)&newPos, vboNewPos));
+
+#if USE_TEX
+
+#if USE_SORT
     // use sorted arrays
-    cutilSafeCall(cudaBindTexture(0, particleHashTex, particleHash, numParticles*sizeof(uint2)));
-    cutilSafeCall(cudaBindTexture(0, cellStartTex, cellStart, numCells*sizeof(uint)));
-    cutilSafeCall(cudaBindTexture(0, cellEndTex, cellEnd, numCells*sizeof(uint)));    
+    CUDA_SAFE_CALL(cudaBindTexture(0, posTex, sortedPos, numBodies*sizeof(float4)));
+    CUDA_SAFE_CALL(cudaBindTexture(0, velTex, sortedVel, numBodies*sizeof(float4)));
+
+    CUDA_SAFE_CALL(cudaBindTexture(0, particleHashTex, particleHash, numBodies*sizeof(uint2)));
+    CUDA_SAFE_CALL(cudaBindTexture(0, cellStartTex, cellStart, gridSize[0]*gridSize[1]*gridSize[2]*sizeof(uint)));
+#else
+
+    CUDA_SAFE_CALL(cudaBindTexture(0, posTex, oldPos, numBodies*sizeof(float4)));
+    CUDA_SAFE_CALL(cudaBindTexture(0, velTex, oldVel, numBodies*sizeof(float4)));
+
+    CUDA_SAFE_CALL(cudaBindTexture(0, gridCountersTex, gridCounters, gridSize[0]*gridSize[1]*gridSize[2]*sizeof(uint)));
+    CUDA_SAFE_CALL(cudaBindTexture(0, gridCellsTex, gridCells, gridSize[0]*gridSize[1]*gridSize[2]*maxParticlesPerCell*sizeof(uint)));
+#endif
+
 #endif
 
     // thread per particle
-    uint numThreads, numBlocks;
-    computeGridSize(numParticles, 64, numBlocks, numThreads);
+    int numThreads = min(BLOCKDIM, numBodies);
+    int numBlocks = (int) ceil(numBodies / (float) numThreads);
 
     // execute the kernel
-    collideD<<< numBlocks, numThreads >>>((float4*)newVel,
-                                          (float4*)sortedPos,
-                                          (float4*)sortedVel,
+    collideD<<< numBlocks, numThreads >>>((float4*)newPos, (float4*)newVel,
+#if USE_SORT
+                                          (float4*)sortedPos, (float4*)sortedVel,
                                           (uint2 *) particleHash,
                                           cellStart,
-                                          cellEnd,
-                                          numParticles);
+#else
+                                          (float4*)oldPos, (float4*)oldVel,
+                                          gridCounters,
+                                          gridCells,
+#endif
+                                          make_uint3(gridSize[0], gridSize[1], gridSize[2]),
+                                          make_float3(cellSize[0], cellSize[1], cellSize[2]),
+                                          make_float3(worldOrigin[0], worldOrigin[1], worldOrigin[2]),
+                                          maxParticlesPerCell,
+                                          particleRadius,
+                                          numBodies,
+                                          make_float4(colliderPos[0], colliderPos[1], colliderPos[2], 1.0f),
+                                          colliderRadius,
+                                          spring, damping, sheer, attraction
+                                          );
 
     // check if kernel invocation generated an error
-    cutilCheckMsg("Kernel execution failed");
+    CUT_CHECK_ERROR("Kernel execution failed");
+
+    CUDA_SAFE_CALL(cudaGLUnmapBufferObject(vboNewPos));
+    CUDA_SAFE_CALL(cudaGLUnmapBufferObject(vboOldPos));
 
 #if USE_TEX
-    cutilSafeCall(cudaUnbindTexture(oldPosTex));
-    cutilSafeCall(cudaUnbindTexture(oldVelTex));
+    CUDA_SAFE_CALL(cudaUnbindTexture(posTex));
+    CUDA_SAFE_CALL(cudaUnbindTexture(velTex));
 
-    cutilSafeCall(cudaUnbindTexture(particleHashTex));
-    cutilSafeCall(cudaUnbindTexture(cellStartTex));
-    cutilSafeCall(cudaUnbindTexture(cellEndTex));
+#if USE_SORT
+    CUDA_SAFE_CALL(cudaUnbindTexture(particleHashTex));
+    CUDA_SAFE_CALL(cudaUnbindTexture(cellStartTex));
+#else
+    CUDA_SAFE_CALL(cudaUnbindTexture(gridCountersTex));
+    CUDA_SAFE_CALL(cudaUnbindTexture(gridCellsTex));
+#endif
 #endif
 }
 

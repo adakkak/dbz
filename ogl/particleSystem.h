@@ -27,20 +27,19 @@
  * source code with only those rights set forth herein.
  */
 
-#ifndef __PARTICLESYSTEM_H__
-#define __PARTICLESYSTEM_H__
+#ifndef __BODYSYSTEMCUDA_H__
+#define __BODYSYSTEMCUDA_H__
 
 #define DEBUG_GRID 0
 #define DO_TIMING 0
 
-#include "particles_kernel.cuh"
-#include "vector_functions.h"
+typedef unsigned int uint;
 
-// Particle system class
+// CUDA BodySystem: runs on the GPU
 class ParticleSystem
 {
 public:
-    ParticleSystem(uint numParticles, uint3 gridSize);
+    ParticleSystem(uint numParticles, uint gridSize[3]);
     ~ParticleSystem();
 
     enum ParticleConfig
@@ -64,30 +63,27 @@ public:
 
     int    getNumParticles() const { return m_numParticles; }
 
-    unsigned int getCurrentReadBuffer() const { return m_posVbo; }
+    unsigned int getCurrentReadBuffer() const { return m_posVbo[m_currentPosRead]; }
     unsigned int getColorBuffer() const { return m_colorVBO; }
 
     void dumpGrid();
     void dumpParticles(uint start, uint count);
 
     void setIterations(int i) { m_solverIterations = i; }
+    void setDamping(float x) { m_damping = x; }
+    void setGravity(float x) { m_gravity = x; }
 
-    void setDamping(float x) { m_params.globalDamping = x; }
-    void setGravity(float x) { m_params.gravity = make_float3(0.0f, x, 0.0f); }
+    void setCollideSpring(float x) { m_collideSpring = x; }
+    void setCollideDamping(float x) { m_collideDamping = x; }
+    void setCollideShear(float x) { m_collideShear = x; }
+    void setCollideAttraction(float x) { m_collideAttraction = x; }
 
-    void setCollideSpring(float x) { m_params.spring = x; }
-    void setCollideDamping(float x) { m_params.damping = x; }
-    void setCollideShear(float x) { m_params.shear = x; }
-    void setCollideAttraction(float x) { m_params.attraction = x; }
-
-    void setColliderPos(float3 x) { m_params.colliderPos = x; }
-
-    float getParticleRadius() { return m_params.particleRadius; }
-    float3 getColliderPos() { return m_params.colliderPos; }
-    float getColliderRadius() { return m_params.colliderRadius; }
-    uint3 getGridSize() { return m_params.gridSize; }
-    float3 getWorldOrigin() { return m_params.worldOrigin; }
-    float3 getCellSize() { return m_params.cellSize; }
+    float getParticleRadius() { return m_particleRadius; }
+    float *getColliderPos() { return m_colliderPos; }
+    float getColliderRadius() { return m_colliderRadius; }
+    unsigned int *getGridSize() { return &m_gridSize[0]; }
+    float *getWorldOrigin() { return &m_worldOrigin[0]; }
+    float *getCellSize() { return &m_cellSize[0]; }
 
     void addSphere(int index, float *pos, float *vel, int r, float spacing);
 
@@ -105,36 +101,58 @@ protected: // data
     uint m_numParticles;
 
     // CPU data
-    float* m_hPos;              // particle positions
-    float* m_hVel;              // particle velocities
+    float* m_hPos;
+    float* m_hVel;
+
+    uint*  m_hGridCounters;
+    uint*  m_hGridCells;
 
     uint*  m_hParticleHash;
     uint*  m_hCellStart;
-    uint*  m_hCellEnd;
 
     // GPU data
-    float* m_dPos;
-    float* m_dVel;
+    float* m_dPos[2];
+    float* m_dVel[2];
 
     float* m_dSortedPos;
     float* m_dSortedVel;
 
-    // grid data for sorting method
-    uint*  m_dParticleHash[2];  // (hash, index) pairs for each particle
-    uint*  m_dCellStart;        // index of start of each cell in sorted list
-    uint*  m_dCellEnd;          // index of end of cell
+    // uniform grid data
+    uint*  m_dGridCounters; // counts number of entries per grid cell
+    uint*  m_dGridCells;    // contains indices of up to "m_maxParticlesPerCell" particles per cell
 
-    uint m_posVbo;              // vertex buffer object for particle positions
-    uint m_colorVBO;            // vertex buffer object for colors
+    uint*  m_dParticleHash[2];
+    uint*  m_dCellStart;
+
+    uint m_posVbo[2];
+    uint m_colorVBO;
+
+    uint m_currentPosRead, m_currentVelRead;
+    uint m_currentPosWrite, m_currentVelWrite;
 
     // params
-    SimParams m_params;
-    uint3 m_gridSize;
-    uint m_numGridCells;
+    uint m_gridSize[3];
+    uint m_fieldGridSize[3];
+    uint m_nGridCells;
+    float m_worldOrigin[3], m_worldSize[3];
+    float m_cellSize[3];
+    uint m_maxParticlesPerCell;
+
+    float m_particleRadius;
+    float m_damping;
+    float m_gravity;
+
+    float m_collideSpring;
+    float m_collideDamping;
+    float m_collideShear;
+    float m_collideAttraction;
+
+    float m_colliderPos[3];
+    float m_colliderRadius;
 
     uint m_timer;
 
     uint m_solverIterations;
 };
 
-#endif // __PARTICLESYSTEM_H__
+#endif // __BODYSYSTEMCUDA_H__

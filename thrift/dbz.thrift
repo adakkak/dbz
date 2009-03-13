@@ -1,13 +1,3 @@
-# Thrift Tutorial
-# Mark Slee (mcslee@facebook.com)
-#
-# This file aims to teach you how to use Thrift, in a .thrift file. Neato. The
-# first thing to notice is that .thrift files support standard shell comments.
-# This lets you make your thrift file executable and include your Thrift build
-# step on the top line. And you can place comments like this anywhere you like.
-#
-# Before running this file, you will need to have installed the thrift compiler
-# into /usr/local/bin.
 
 /**
  * The first thing to know about are types. The available types in Thrift are:
@@ -27,39 +17,10 @@
  * Did you also notice that Thrift supports C style comments?
  */
 
-// Just in case you were wondering... yes. We support simple C comments too.
+namespace cpp dbz
+namespace java dbz
 
-/**
- * Thrift files can reference other Thrift files to include common struct
- * and service definitions. These are found using the current path, or by
- * searching relative to any paths specified with the -I compiler flag.
- *
- * Included objects are accessed using the name of the .thrift file as a
- * prefix. i.e. shared.SharedObject
- */
-include "shared.thrift"
-
-/**
- * Thrift files can namespace, package, or prefix their output in various
- * target languages.
- */
-namespace cpp tutorial
-namespace java tutorial
-namespace php tutorial
-namespace perl tutorial
-namespace smalltalk.category Thrift.Tutorial
-
-/**
- * Thrift lets you do typedefs to get pretty names for your types. Standard
- * C style here.
- */
-typedef i32 MyInteger
-
-/**
- * Thrift also lets you define constants for use across languages. Complex
- * types and structs are specified using JSON notation.
- */
-const i32 INT32CONSTANT = 9853
+const i32 PORT = 9853
 const map<string,string> MAPCONSTANT = {'hello':'world', 'goodnight':'moon'}
 
 /**

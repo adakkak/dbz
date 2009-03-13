@@ -32,7 +32,7 @@
 #include "radixsort.cuh"
 #include "particles_kernel.cuh"
 
-#include <cutil_inline.h>
+#include <cutil.h>
 
 #include <assert.h>
 #include <math.h>
@@ -46,42 +46,52 @@
 #define CUDART_PI_F         3.141592654f
 #endif
 
-ParticleSystem::ParticleSystem(uint numParticles, uint3 gridSize) :
+ParticleSystem::ParticleSystem(uint numParticles, uint gridSize[3]) :
     m_bInitialized(false),
     m_numParticles(numParticles),
     m_hPos(0),
     m_hVel(0),
-    m_dPos(0),
-    m_dVel(0),
-    m_gridSize(gridSize),
+    m_currentPosRead(0),
+    m_currentVelRead(0),
+    m_currentPosWrite(1),
+    m_currentVelWrite(1),
+    m_maxParticlesPerCell(4),
+    m_damping(1.0f),
+    m_gravity(-0.001f),
+    m_collideSpring(0.5f),
+    m_collideDamping(0.01f),
+    m_collideShear(0.01f),
+    m_collideAttraction(0.0f),
+    m_colliderRadius(0.2f),
     m_timer(0),
     m_solverIterations(1)
 {
-    m_numGridCells = m_gridSize.x*m_gridSize.y*m_gridSize.z;
-    float3 worldSize = make_float3(2.0f, 2.0f, 2.0f);
+    m_dPos[0] = m_dPos[1] = 0;
+    m_dVel[0] = m_dVel[1] = 0;
 
-    // set simulation parameters
-    m_params.gridSize = m_gridSize;
-    m_params.numCells = m_numGridCells;
-    m_params.numBodies = m_numParticles;
+    m_gridSize[0] = gridSize[0];
+    m_gridSize[1] = gridSize[1];
+    m_gridSize[2] = gridSize[2];
 
-    m_params.particleRadius = 1.0f / 64.0f;
-    m_params.colliderPos = make_float3(-1.2f, -0.8f, 0.8f);
-    m_params.colliderRadius = 0.2f;
+    m_nGridCells = m_gridSize[0]*m_gridSize[1]*m_gridSize[2];
 
-    m_params.worldOrigin = make_float3(-1.0f, -1.0f, -1.0f);
-//    m_params.cellSize = make_float3(worldSize.x / m_gridSize.x, worldSize.y / m_gridSize.y, worldSize.z / m_gridSize.z);
-    float cellSize = m_params.particleRadius * 2.0f;  // cell size equal to particle diameter
-    m_params.cellSize = make_float3(cellSize, cellSize, cellSize);
+    m_worldOrigin[0] = -1.0f;
+    m_worldOrigin[1] = -1.0f;
+    m_worldOrigin[2] = -1.0f;
 
-    m_params.spring = 0.5f;
-    m_params.damping = 0.02f;
-    m_params.shear = 0.1f;
-    m_params.attraction = 0.0f;
-    m_params.boundaryDamping = -0.5f;
+    m_worldSize[0] = 2.0f;
+    m_worldSize[1] = 2.0f;
+    m_worldSize[2] = 2.0f;
 
-    m_params.gravity = make_float3(0.0f, -0.0003f, 0.0f);
-    m_params.globalDamping = 1.0f;
+    m_cellSize[0] = m_worldSize[0] / m_gridSize[0];
+    m_cellSize[1] = m_worldSize[1] / m_gridSize[1];
+    m_cellSize[2] = m_worldSize[2] / m_gridSize[2];
+
+    m_particleRadius = m_cellSize[0] * 0.5f;
+
+    m_colliderPos[0] = -1.2f;
+    m_colliderPos[1] = -0.8f;
+    m_colliderPos[2] = 0.8f;
 
     _initialize(numParticles);
 }
@@ -92,7 +102,7 @@ ParticleSystem::~ParticleSystem()
     m_numParticles = 0;
 }
 
-uint
+GLuint
 ParticleSystem::createVBO(uint size)
 {
     GLuint vbo;
@@ -109,18 +119,17 @@ inline float lerp(float a, float b, float t)
     return a + t*(b-a);
 }
 
-// create a color ramp
 void colorRamp(float t, float *r)
 {
     const int ncolors = 7;
     float c[ncolors][3] = {
         { 1.0, 0.0, 0.0, },
-        { 1.0, 0.5, 0.0, },
-	    { 1.0, 1.0, 0.0, },
-	    { 0.0, 1.0, 0.0, },
-	    { 0.0, 1.0, 1.0, },
-	    { 0.0, 0.0, 1.0, },
-	    { 1.0, 0.0, 1.0, },
+        {  1.0, 0.5, 0.0, },
+	{  1.0, 1.0, 0.0, },
+	{  0.0, 1.0, 0.0, },
+	{  0.0, 1.0, 1.0, },
+	{  0.0, 0.0, 1.0, },
+	{  1.0, 0.0, 1.0, },
     };
     t = t * (ncolors-1);
     int i = (int) t;
@@ -134,6 +143,7 @@ void
 ParticleSystem::_initialize(int numParticles)
 {
     assert(!m_bInitialized);
+    checkCUDA();
 
     m_numParticles = numParticles;
 
@@ -143,31 +153,41 @@ ParticleSystem::_initialize(int numParticles)
     memset(m_hPos, 0, m_numParticles*4*sizeof(float));
     memset(m_hVel, 0, m_numParticles*4*sizeof(float));
 
+    m_hGridCounters = new uint[m_nGridCells];
+    m_hGridCells = new uint[m_nGridCells*m_maxParticlesPerCell];
+    memset(m_hGridCounters, 0, m_nGridCells*sizeof(uint));
+    memset(m_hGridCells, 0, m_nGridCells*m_maxParticlesPerCell*sizeof(uint));
+
     m_hParticleHash = new uint[m_numParticles*2];
     memset(m_hParticleHash, 0, m_numParticles*2*sizeof(uint));
 
-    m_hCellStart = new uint[m_numGridCells];
-    memset(m_hCellStart, 0, m_numGridCells*sizeof(uint));
-
-    m_hCellEnd = new uint[m_numGridCells];
-    memset(m_hCellEnd, 0, m_numGridCells*sizeof(uint));
+    m_hCellStart = new uint[m_nGridCells];
+    memset(m_hCellStart, 0, m_nGridCells*sizeof(uint));
 
     // allocate GPU data
     unsigned int memSize = sizeof(float) * 4 * m_numParticles;
 
-    m_posVbo = createVBO(memSize);    
-    allocateArray((void**)&m_dVel, memSize);
+    m_posVbo[0] = createVBO(memSize);
+    m_posVbo[1] = createVBO(memSize);
+    
+    allocateArray((void**)&m_dVel[0], memSize);
+    allocateArray((void**)&m_dVel[1], memSize);
 
     allocateArray((void**)&m_dSortedPos, memSize);
     allocateArray((void**)&m_dSortedVel, memSize);
 
+#if USE_SORT
     allocateArray((void**)&m_dParticleHash[0], m_numParticles*2*sizeof(uint));
     allocateArray((void**)&m_dParticleHash[1], m_numParticles*2*sizeof(uint));
-    allocateArray((void**)&m_dCellStart, m_numGridCells*sizeof(uint));
-    allocateArray((void**)&m_dCellEnd, m_numGridCells*sizeof(uint));
+    allocateArray((void**)&m_dCellStart, m_nGridCells*sizeof(uint));
+#else
+    allocateArray((void**)&m_dGridCounters, m_nGridCells*sizeof(uint));
+    allocateArray((void**)&m_dGridCells, m_nGridCells*m_maxParticlesPerCell*sizeof(uint));
+#endif
 
     m_colorVBO = createVBO(m_numParticles*4*sizeof(float));
 
+#if 1
     // fill color buffer
     glBindBufferARB(GL_ARRAY_BUFFER, m_colorVBO);
     float *data = (float *) glMapBufferARB(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
@@ -185,10 +205,9 @@ ParticleSystem::_initialize(int numParticles)
         *ptr++ = 1.0f;
     }
     glUnmapBufferARB(GL_ARRAY_BUFFER);
+#endif
 
-    cutilCheckError(cutCreateTimer(&m_timer));
-
-    setParameters(&m_params);
+    CUT_SAFE_CALL(cutCreateTimer(&m_timer));
 
     m_bInitialized = true;
 }
@@ -200,98 +219,168 @@ ParticleSystem::_finalize()
 
     delete [] m_hPos;
     delete [] m_hVel;
-    delete [] m_hParticleHash;
-    delete m_hCellStart;
-    delete m_hCellEnd;
 
-    freeArray(m_dVel);
-    freeArray(m_dSortedPos);
-    freeArray(m_dSortedVel);
+    delete [] m_hGridCounters;
+    delete [] m_hGridCells;
 
-    freeArray(m_dParticleHash[0]);
-    freeArray(m_dParticleHash[1]);
-    freeArray(m_dCellStart);
-    freeArray(m_dCellEnd);
+    freeArray(&m_dVel[0]);
+    freeArray(&m_dVel[1]);
 
-    unregisterGLBufferObject(m_posVbo);
-    glDeleteBuffers(1, (const GLuint*)&m_posVbo);
-    glDeleteBuffers(1, (const GLuint*)&m_colorVBO);
+    freeArray(&m_dSortedPos);
+    freeArray(&m_dSortedVel);
+
+#if USE_SORT
+    freeArray(&m_dParticleHash[0]);
+    freeArray(&m_dParticleHash[1]);
+    freeArray(&m_dCellStart);
+#else
+    freeArray(&m_dGridCounters);
+    freeArray(&m_dGridCells);
+#endif
+
+    unregisterGLBufferObject(m_posVbo[0]);
+    unregisterGLBufferObject(m_posVbo[1]);
+    glDeleteBuffers(2, m_posVbo);
+
+    glDeleteBuffers(1, &m_colorVBO);
 }
 
-// step the simulation
 void 
 ParticleSystem::update(float deltaTime)
 {
     assert(m_bInitialized);
 
-    // update constants
-    setParameters(&m_params);
-
-    float *dPos = (float *) mapGLBufferObject(m_posVbo);
-
     // integrate
-    integrateSystem(dPos,
-                    m_dVel,
+    integrateSystem(m_posVbo[m_currentPosRead], m_posVbo[m_currentPosWrite],
+                    m_dVel[m_currentVelRead], m_dVel[m_currentVelWrite], 
                     deltaTime,
+                    m_damping,
+                    m_particleRadius,
+                    m_gravity,
                     m_numParticles);
 
-    // calculate grid hash
-    calcHash(m_dParticleHash[0],
-             dPos,
+    std::swap(m_currentPosRead, m_currentPosWrite);
+    std::swap(m_currentVelRead, m_currentVelWrite);
+
+#if USE_SORT
+    // sort and search method
+
+    // calculate hash
+    calcHash(m_posVbo[m_currentPosRead],
+             m_dParticleHash[0],
+             m_gridSize,
+             m_cellSize,
+             m_worldOrigin,
              m_numParticles);
+
+#if DEBUG_GRID
+    copyArrayFromDevice((void *) m_hParticleHash, (void *) m_dParticleHash[0], 0, sizeof(uint)*2*m_numParticles);
+    printf("particle hash:\n");
+    for(uint i=0; i<m_numParticles; i++) {
+        printf("%d: %d, %d\n", i, m_hParticleHash[i*2], m_hParticleHash[i*2+1]);
+    }
+#endif
 
     // sort particles based on hash
     RadixSort((KeyValuePair *) m_dParticleHash[0], (KeyValuePair *) m_dParticleHash[1], m_numParticles, 32);
 
-	// reorder particle arrays into sorted order and
-	// find start and end of each cell
-	reorderDataAndFindCellStart(m_dCellStart,
-                                m_dCellEnd,
-								m_dSortedPos,
-								m_dSortedVel,
-                                m_dParticleHash[0],
-								dPos,
-								m_dVel,
-								m_numParticles,
-								m_numGridCells);
+#if DEBUG_GRID
+    copyArrayFromDevice((void *) m_hParticleHash, (void *) m_dParticleHash[0], 0, sizeof(uint)*2*m_numParticles);
+    printf("particle hash sorted:\n");
+    for(uint i=0; i<m_numParticles; i++) {
+        printf("%d: %d, %d\n", i, m_hParticleHash[i*2], m_hParticleHash[i*2+1]);
+    }
+#endif
 
-    unmapGLBufferObject(m_posVbo);
+    // reorder particle arrays into sorted order
+    reorderData(m_dParticleHash[0],
+                m_posVbo[m_currentPosRead],
+                m_dVel[m_currentVelRead],
+                m_dSortedPos,
+                m_dSortedVel,
+                m_numParticles);
+
+    // find start of each cell
+    findCellStart(m_dParticleHash[0], m_dCellStart, m_numParticles, m_nGridCells);
+
+#if DEBUG_GRID
+    copyArrayFromDevice((void *) m_hCellStart, (void *) m_dCellStart, 0, sizeof(uint)*m_nGridCells);
+    printf("cell start:\n");
+    for(uint i=0; i<m_nGridCells; i++) {
+        printf("%d: %d\n", i, m_hCellStart[i]);
+    }
+#endif
+
+#else
+    // update grid using atomics
+    updateGrid(m_posVbo[m_currentPosRead],
+               m_dGridCounters,
+               m_dGridCells,
+               m_gridSize,
+               m_cellSize,
+               m_worldOrigin,
+               m_maxParticlesPerCell,
+               m_numParticles);
+#endif
 
     // process collisions
-    collide(m_dVel,
-            m_dSortedPos,
-            m_dSortedVel,
-            m_dParticleHash[0],
-            m_dCellStart,
-            m_dCellEnd,
-            m_numParticles,
-            m_numGridCells);
+    for(uint i=0; i<m_solverIterations; i++) {
+        collide(m_posVbo[m_currentPosRead], m_posVbo[m_currentPosWrite],
+                m_dSortedPos, m_dSortedVel,
+                m_dVel[m_currentVelRead], m_dVel[m_currentVelWrite],
+                m_dGridCounters,
+                m_dGridCells,
+                m_dParticleHash[0],
+                m_dCellStart,
+                m_gridSize,
+                m_cellSize,
+                m_worldOrigin,
+                m_maxParticlesPerCell,
+                m_particleRadius,
+                m_numParticles,
+                m_colliderPos,
+                m_colliderRadius,
+                m_collideSpring,
+                m_collideDamping,
+                m_collideShear,
+                m_collideAttraction
+                );
+
+        std::swap(m_currentVelRead, m_currentVelWrite);
+    }
 
 }
 
 void
 ParticleSystem::dumpGrid()
 {
-    // dump grid information
-    copyArrayFromDevice(m_hCellStart, m_dCellStart, 0, sizeof(uint)*m_numGridCells);
-    copyArrayFromDevice(m_hCellEnd, m_dCellEnd, 0, sizeof(uint)*m_numGridCells);
-    uint maxCellSize = 0;
-    for(uint i=0; i<m_numGridCells; i++) {
-        if (m_hCellStart[i] != 0xffffffff) {
-            uint cellSize = m_hCellEnd[i] - m_hCellStart[i];
-//            printf("cell: %d, %d particles\n", i, cellSize);
-            if (cellSize > maxCellSize) maxCellSize = cellSize;
+    // debug
+    copyArrayFromDevice(m_hGridCounters, m_dGridCounters, 0, sizeof(uint)*m_nGridCells);
+    copyArrayFromDevice(m_hGridCells, m_dGridCells, 0, sizeof(uint)*m_nGridCells*m_maxParticlesPerCell);
+    uint total = 0;
+    uint maxPerCell = 0;
+    for(uint i=0; i<m_nGridCells; i++) {
+        if (m_hGridCounters[i] > maxPerCell)
+            maxPerCell = m_hGridCounters[i];
+        if (m_hGridCounters[i] > 0) {
+            printf("%d (%d): ", i, m_hGridCounters[i]);
+            for(uint j=0; j<m_hGridCounters[i]; j++) {
+                printf("%d ", m_hGridCells[i*m_maxParticlesPerCell + j]);
+            }
+            total += m_hGridCounters[i];
+            printf("\n");
         }
     }
-    printf("maximum particles per cell = %d\n", maxCellSize);
+    printf("max per cell = %d\n", maxPerCell);
+    printf("total = %d\n", total);
 }
 
 void
 ParticleSystem::dumpParticles(uint start, uint count)
 {
     // debug
-    copyArrayFromDevice(m_hPos, 0, m_posVbo, sizeof(float)*4*count);
-    copyArrayFromDevice(m_hVel, m_dVel, 0, sizeof(float)*4*count);
+    copyArrayFromDevice(m_hPos, 0, m_posVbo[m_currentPosRead], sizeof(float)*4*count);
+    copyArrayFromDevice(m_hVel, m_dVel[m_currentVelRead], 0, sizeof(float)*4*count);
 
     for(uint i=start; i<start+count; i++) {
 //        printf("%d: ", i);
@@ -315,12 +404,12 @@ ParticleSystem::getArray(ParticleArray array)
     default:
     case POSITION:
         hdata = m_hPos;
-        ddata = m_dPos;
-        vbo = m_posVbo;
+        ddata = m_dPos[m_currentPosRead];
+        vbo = m_posVbo[m_currentPosRead];
         break;
     case VELOCITY:
         hdata = m_hVel;
-        ddata = m_dVel;
+        ddata = m_dVel[m_currentVelRead];
         break;
     }
 
@@ -338,15 +427,15 @@ ParticleSystem::setArray(ParticleArray array, const float* data, int start, int 
     default:
     case POSITION:
         {
-            unregisterGLBufferObject(m_posVbo);
-            glBindBuffer(GL_ARRAY_BUFFER, m_posVbo);
+            unregisterGLBufferObject(m_posVbo[m_currentPosRead]);
+            glBindBuffer(GL_ARRAY_BUFFER, m_posVbo[m_currentPosRead]);
             glBufferSubData(GL_ARRAY_BUFFER, start*4*sizeof(float), count*4*sizeof(float), data);
             glBindBuffer(GL_ARRAY_BUFFER, 0);
-            registerGLBufferObject(m_posVbo);
+            registerGLBufferObject(m_posVbo[m_currentPosRead]);
         }
         break;
     case VELOCITY:
-        copyArrayToDevice(m_dVel, data, start*4*sizeof(float), count*4*sizeof(float));
+        copyArrayToDevice(m_dVel[m_currentVelRead], data, start*4*sizeof(float), count*4*sizeof(float));
         break;
     }       
 }
@@ -365,9 +454,9 @@ ParticleSystem::initGrid(uint *size, float spacing, float jitter, uint numPartic
             for(uint x=0; x<size[0]; x++) {
                 uint i = (z*size[1]*size[0]) + (y*size[0]) + x;
                 if (i < numParticles) {
-                    m_hPos[i*4] = (spacing * x) + m_params.particleRadius - 1.0f + (frand()*2.0f-1.0f)*jitter;
-                    m_hPos[i*4+1] = (spacing * y) + m_params.particleRadius - 1.0f + (frand()*2.0f-1.0f)*jitter;
-                    m_hPos[i*4+2] = (spacing * z) + m_params.particleRadius - 1.0f + (frand()*2.0f-1.0f)*jitter;
+                    m_hPos[i*4] = (spacing * x) + m_particleRadius - 1.0f + (frand()*2.0f-1.0f)*jitter;
+                    m_hPos[i*4+1] = (spacing * y) + m_particleRadius - 1.0f + (frand()*2.0f-1.0f)*jitter;
+                    m_hPos[i*4+2] = (spacing * z) + m_particleRadius - 1.0f + (frand()*2.0f-1.0f)*jitter;
                     m_hPos[i*4+3] = 1.0f;
 
 				    m_hVel[i*4] = 0.0f;
@@ -409,11 +498,11 @@ ParticleSystem::reset(ParticleConfig config)
 
     case CONFIG_GRID:
         {
-            float jitter = m_params.particleRadius*0.01f;
+            float jitter = m_particleRadius*0.01f;
             uint s = (int) ceilf(powf((float) m_numParticles, 1.0f / 3.0f));
             uint gridSize[3];
             gridSize[0] = gridSize[1] = gridSize[2] = s;
-            initGrid(gridSize, m_params.particleRadius*2.0f, jitter, m_numParticles);
+            initGrid(gridSize, m_particleRadius*2.0f, jitter, m_numParticles);
         }
         break;
 	}
@@ -433,11 +522,10 @@ ParticleSystem::addSphere(int start, float *pos, float *vel, int r, float spacin
                 float dy = y*spacing;
                 float dz = z*spacing;
                 float l = sqrtf(dx*dx + dy*dy + dz*dz);
-                float jitter = m_params.particleRadius*0.01f;
-                if ((l <= m_params.particleRadius*2.0f*r) && (index < m_numParticles)) {
-                    m_hPos[index*4]   = pos[0] + dx + (frand()*2.0f-1.0f)*jitter;
-                    m_hPos[index*4+1] = pos[1] + dy + (frand()*2.0f-1.0f)*jitter; 
-                    m_hPos[index*4+2] = pos[2] + dz + (frand()*2.0f-1.0f)*jitter;
+                if ((l <= m_particleRadius*2.0f*r) && (index < m_numParticles)) {
+                    m_hPos[index*4]   = pos[0] + dx;
+                    m_hPos[index*4+1] = pos[1] + dy; 
+                    m_hPos[index*4+2] = pos[2] + dz;
                     m_hPos[index*4+3] = pos[3];
 
                     m_hVel[index*4]   = vel[0];

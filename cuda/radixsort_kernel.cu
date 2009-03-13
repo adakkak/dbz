@@ -75,7 +75,7 @@ static const int SHUFFLE_GRFELEMENTS = SHUFFLE_GRFOFFSET + PREFIX_NUM_BLOCKS;
 static const int SHUFFLE_GRFSIZE = SHUFFLE_GRFELEMENTS * sizeof(uint); 
 
 
-#define SDATA( index)      cutilBankChecker(sdata, index)
+#define SDATA( index)      CUT_BANK_CHECKER(sdata, index)
 
 // Prefix sum data
 uint gRadixSum[TOTALRADIXGROUPS * RADICES];
@@ -222,7 +222,9 @@ __global__ void RadixSum(KeyValuePair *pData, uint elements, uint elements_round
                 
     }
 
-//    __syncthreads();
+    __syncthreads();
+
+    __syncthreads();
 
     // Output radix sums into separate memory regions for each radix group
     // So this memory then is layed out:
@@ -315,7 +317,7 @@ __global__ void RadixPrefixSum()
         __syncthreads();
         m *= 2;
     } 
-//    __syncthreads();
+    __syncthreads();
 
   
   
@@ -569,7 +571,7 @@ __global__ void RadixAddOffsetsAndShuffle(KeyValuePair* pSrc, KeyValuePair* pDst
         pos += RADIXTHREADS;
     }
 
-//    __syncthreads();
+    __syncthreads();
 }
 
 #endif // #ifndef _RADIXSORT_KERNEL_H_

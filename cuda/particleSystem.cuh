@@ -1,6 +1,6 @@
 extern "C"
 {
-void cudaInit(int argc, char **argv);
+void checkCUDA();
 
 void allocateArray(void **devPtr, int size);
 void freeArray(void *devPtr);
@@ -11,37 +11,64 @@ void copyArrayFromDevice(void* host, const void* device, unsigned int vbo, int s
 void copyArrayToDevice(void* device, const void* host, int offset, int size);
 void registerGLBufferObject(unsigned int vbo);
 void unregisterGLBufferObject(unsigned int vbo);
-void *mapGLBufferObject(uint vbo);
-void unmapGLBufferObject(uint vbo);
 
-void setParameters(SimParams *hostParams);
-
-void integrateSystem(float *pos,
-                     float *vel,
+void integrateSystem(uint vboOldPos, uint vboNewPos,
+                     float* oldVel, float* newVel,
                      float deltaTime,
-                     uint numParticles);
+                     float damping,
+                     float particleRadius,
+                     float gravity,
+                     int numBodies);
 
-void calcHash(uint*  particleHash,
-              float* pos, 
-              int    numParticles);
+void updateGrid(uint vboPos, 
+                uint*   gridCounters,
+                uint*   gridCells,
+                uint    gridSize[3],
+                float   cellSize[3],
+                float   worldOrigin[3],
+                int     maxParticlesPerCell,
+                int     numBodies);
 
-void reorderDataAndFindCellStart(uint*  cellStart,
-							     uint*  cellEnd,
-							     float* sortedPos,
-							     float* sortedVel,
-                                 uint*  particleHash,
-							     float* oldPos,
-							     float* oldVel,
-							     uint   numParticles,
-							     uint   numCells);
+void 
+calcHash(uint    vboPos, 
+         uint*   particleHash,
+         uint    gridSize[3],
+         float   cellSize[3],
+         float   worldOrigin[3],
+         int     numBodies);
 
-void collide(float* newVel,
-             float* sortedPos,
-             float* sortedVel,
-             uint*  particleHash,
-             uint*  cellStart,
-             uint*  cellEnd,
-             uint   numParticles,
-             uint   numCells);
+void 
+findCellStart(uint* particleHash,
+              uint* cellStart,
+              uint numBodies,
+              uint numGridCells);
+
+void 
+reorderData(uint* particleHash,
+            uint vboOldPos,
+            float* oldVel,
+            float* sortedPos,
+            float* sortedVel,
+            uint numBodies);
+
+void collide(uint    vboOldPos, uint vboNewPos,
+             float*  sortedPos, float* sortedVel,
+             float*  oldVel, float* newVel, 
+             uint*   gridCounters,
+             uint*   gridCells,
+             uint*   particleHash,
+             uint*   cellStart,
+             uint    gridSize[3],
+             float   cellSize[3],
+             float   worldOrigin[3],
+             int     maxParticlesPerCell,
+             float   particleRadius,
+             uint    numBodies,
+             float   *colliderPos,
+             float   colliderRadius,
+             float   spring,
+             float   damping,
+             float   shear,
+             float   attraction);
 
 }

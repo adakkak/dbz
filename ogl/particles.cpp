@@ -1,5 +1,5 @@
 /*
- * Copyright 1993-2008 NVIDIA Corporation.  All rights reserved.
+ * Copyright 1993-2007 NVIDIA Corporation.  All rights reserved.
  *
  * NOTICE TO USER:   
  *
@@ -29,24 +29,16 @@
 
 /*
     Particle system example with collisions using uniform grid
-
-    CUDA 2.1 SDK release 12/2008
-    - removed atomic grid method, some optimization, added demo mode.
 */
 
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
 #include <math.h>
-#include <cutil_inline.h>
+#include <cutil.h>
 
 #include <GL/glew.h>
-
-#if defined(__APPLE__) || defined(MACOSX)
-#include <GLUT/glut.h>
-#else
 #include <GL/glut.h>
-#endif
 
 #include "particleSystem.h"
 #include "render_particles.h"
@@ -67,15 +59,11 @@ bool displayEnabled = true;
 bool bPause = false;
 bool displaySliders = false;
 bool wireframe = false;
-bool demoMode = false;
-int idleCounter = 0;
-int demoCounter = 0;
-const int idleDelay = 2000;
 
 enum { M_VIEW = 0, M_MOVE };
 
 uint numParticles = 0;
-uint3 gridSize;
+uint gridSize[3];
 int numIterations = 0; // run until exit
 
 // simulation parameters
@@ -103,10 +91,7 @@ float modelView[16];
 
 ParamListGL *params;
 
-extern "C" void cudaInit(int argc, char **argv);
-
-// initialize particle system
-void init(int numParticles, uint3 gridSize)
+void init(int numParticles, uint *gridSize)
 {
     psystem = new ParticleSystem(numParticles, gridSize); 
     psystem->reset(ParticleSystem::CONFIG_GRID);
@@ -115,10 +100,9 @@ void init(int numParticles, uint3 gridSize)
     renderer->setParticleRadius(psystem->getParticleRadius());
     renderer->setColorBuffer(psystem->getColorBuffer());
 
-    cutilCheckError(cutCreateTimer(&timer));
+    CUT_SAFE_CALL(cutCreateTimer(&timer));
 }
 
-// initialize OpenGL
 void initGL()
 {  
     glewInit();
@@ -135,14 +119,12 @@ void initGL()
 
 void runBenchmark(int iterations)
 {
-    cudaThreadSynchronize();
-    cutilCheckError(cutStartTimer(timer));  
+    CUT_SAFE_CALL(cutStartTimer(timer));  
     for (int i = 0; i < iterations; ++i)
     {
         psystem->update(timestep);
     }
-    cudaThreadSynchronize();
-    cutilCheckError(cutStopTimer(timer));  
+    CUT_SAFE_CALL(cutStopTimer(timer));  
     float milliseconds = cutGetTimerValue(timer);
 
     printf("%d particles, total time for %d iterations: %0.3f ms\n", numParticles, iterations, milliseconds);
@@ -151,7 +133,7 @@ void runBenchmark(int iterations)
 
 void display()
 {
-    cutilCheckError(cutStartTimer(timer));  
+    CUT_SAFE_CALL(cutStartTimer(timer));  
 
     // update the simulation
     if (!bPause)
@@ -191,8 +173,8 @@ void display()
 
     // collider
     glPushMatrix();
-    float3 p = psystem->getColliderPos();
-    glTranslatef(p.x, p.y, p.z);
+    float *p = psystem->getColliderPos();
+    glTranslatef(p[0], p[1], p[2]);
     glColor3f(1.0, 0.0, 0.0);
     glutSolidSphere(psystem->getColliderRadius(), 20, 10);
     glPopMatrix();
@@ -211,7 +193,7 @@ void display()
         glEnable(GL_DEPTH_TEST);
     }
 
-    cutilCheckError(cutStopTimer(timer));  
+    CUT_SAFE_CALL(cutStopTimer(timer));  
 
     glutSwapBuffers();
 
@@ -225,36 +207,17 @@ void display()
         fpsCount = 0; 
         fpsLimit = (ifps > 1.f) ? (int)ifps : 1;
         if (bPause) fpsLimit = 0;
-        cutilCheckError(cutResetTimer(timer));  
+        CUT_SAFE_CALL(cutResetTimer(timer));  
     }
 
     glutReportErrors();
-}
-
-inline float frand()
-{
-    return rand() / (float) RAND_MAX;
-}
-
-void addSphere()
-{
-    // inject a sphere of particles
-    float pr = psystem->getParticleRadius();
-    float tr = pr+(pr*2.0f)*ballr;
-    float pos[4], vel[4];
-    pos[0] = -1.0 + tr + frand()*(2.0f - tr*2.0f);
-    pos[1] = 1.0f - tr;
-    pos[2] = -1.0 + tr + frand()*(2.0f - tr*2.0f);
-    pos[3] = 0.0f;
-    vel[0] = vel[1] = vel[2] = vel[3] = 0.0f;
-    psystem->addSphere(0, pos, vel, ballr, pr*2.0f);
 }
 
 void reshape(int w, int h)
 {
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluPerspective(60.0, (float) w / (float) h, 0.1, 100.0);
+    gluPerspective(60.0, (float) w / (float) h, 0.1, 10.0);
 
     glMatrixMode(GL_MODELVIEW);
     glViewport(0, 0, w, h);
@@ -280,9 +243,6 @@ void mouse(int button, int state, int x, int y)
     }
 
     ox = x; oy = y;
-
-    demoMode = false;
-    idleCounter = 0;
 
     if (displaySliders) {
         if (params->Mouse(x, y, button, state)) {
@@ -356,37 +316,37 @@ void motion(int x, int y)
     case M_MOVE:
         {
             float translateSpeed = 0.003f;
-            float3 p = psystem->getColliderPos();
+            float *p = psystem->getColliderPos();
             if (buttonState==1) {
                 float v[3], r[3];
                 v[0] = dx*translateSpeed;
                 v[1] = -dy*translateSpeed;
                 v[2] = 0.0f;
                 ixform(v, r, modelView);
-                p.x += r[0];
-                p.y += r[1];
-                p.z += r[2];
+                p[0] += r[0];
+                p[1] += r[1];
+                p[2] += r[2];
             } else if (buttonState==2) {
                 float v[3], r[3];
                 v[0] = 0.0f;
                 v[1] = 0.0f;
                 v[2] = dy*translateSpeed;
                 ixform(v, r, modelView);
-                p.x += r[0];
-                p.y += r[1];
-                p.z += r[2];
+                p[0] += r[0];
+                p[1] += r[1];
+                p[2] += r[2];
             }
-            psystem->setColliderPos(p);
         }
         break;
     }
 
     ox = x; oy = y;
-
-    demoMode = false;
-    idleCounter = 0;
-
     glutPostRedisplay();
+}
+
+inline float frand()
+{
+    return rand() / (float) RAND_MAX;
 }
 
 // commented out to remove unused parameter warnings in Linux
@@ -419,7 +379,7 @@ void key(unsigned char key, int /*x*/, int /*y*/)
         psystem->dumpGrid();
         break;
     case 'u':
-        psystem->dumpParticles(0, numParticles-1);
+        psystem->dumpParticles(0, 1);
         break;
 
     case 'r':
@@ -433,7 +393,18 @@ void key(unsigned char key, int /*x*/, int /*y*/)
         psystem->reset(ParticleSystem::CONFIG_RANDOM);
         break;
     case '3':
-        addSphere();
+        {
+            // inject a sphere of particles
+            float pr = psystem->getParticleRadius();
+            float tr = pr+(pr*2.0f)*ballr;
+            float pos[4], vel[4];
+            pos[0] = -1.0 + tr + frand()*(2.0f - tr*2.0f);
+            pos[1] = 1.0f - tr;
+            pos[2] = -1.0 + tr + frand()*(2.0f - tr*2.0f);
+            pos[3] = 0.0f;
+            vel[0] = vel[1] = vel[2] = vel[3] = 0.0f;
+            psystem->addSphere(0, pos, vel, ballr, pr*2.0f);
+        }
         break;
     case '4':
         {
@@ -466,8 +437,6 @@ void key(unsigned char key, int /*x*/, int /*y*/)
         break;
     }
 
-    demoMode = false;
-    idleCounter = 0;
     glutPostRedisplay();
 }
 
@@ -476,26 +445,10 @@ void special(int k, int x, int y)
     if (displaySliders) {
         params->Special(k, x, y);
     }
-    demoMode = false;
-    idleCounter = 0;
 }
 
 void idle(void)
 {
-    if ((idleCounter++ > idleDelay) && (demoMode==false)) {
-        demoMode = true;
-        printf("Entering demo mode\n");
-    }
-
-    if (demoMode) {
-        camera_rot[1] += 0.1f;
-        if (demoCounter++ > 1000) {
-            ballr = 10 + (rand() % 10);
-            addSphere();
-            demoCounter = 0;
-        }
-    }
-
     glutPostRedisplay();
 }
 
@@ -504,9 +457,10 @@ void initParams()
     // create a new parameter list
     params = new ParamListGL("misc");
     params->AddParam(new Param<float>("time step", timestep, 0.0, 1.0, 0.01, &timestep));
+    params->AddParam(new Param<int>("iterations", iterations, 0, 10, 1, &iterations));
     params->AddParam(new Param<float>("damping", damping, 0.0, 1.0, 0.001, &damping));
     params->AddParam(new Param<float>("gravity", gravity, 0.0, 0.001, 0.0001, &gravity));
-    params->AddParam(new Param<int>("ball radius", ballr, 1, 20, 1, &ballr));
+    params->AddParam(new Param<int>("ball r", ballr, 1, 20, 1, &ballr));
 
     params->AddParam(new Param<float>("collide spring", collideSpring, 0.0, 1.0, 0.001, &collideSpring));
     params->AddParam(new Param<float>("collide damping", collideDamping, 0.0, 0.1, 0.001, &collideDamping));
@@ -539,7 +493,7 @@ void initMenus()
 // Program main
 ////////////////////////////////////////////////////////////////////////////////
 int
-main(int argc, char** argv) 
+main( int argc, char** argv) 
 {
     numParticles = 32768;
     uint gridDim = 64;
@@ -547,14 +501,12 @@ main(int argc, char** argv)
 
     cutGetCmdLineArgumenti( argc, (const char**) argv, "n", (int *) &numParticles);
     cutGetCmdLineArgumenti( argc, (const char**) argv, "grid", (int *) &gridDim);
-    gridSize.x = gridSize.y = gridSize.z = gridDim;
-    printf("grid: %d x %d x %d = %d cells\n", gridSize.x, gridSize.y, gridSize.z, gridSize.x*gridSize.y*gridSize.z);
+    gridSize[0] = gridSize[1] = gridSize[2] = gridDim;
+    printf("grid: %d x %d x %d = %d cells\n", gridSize[0], gridSize[1], gridSize[2], gridSize[0]*gridSize[1]*gridSize[2]);
 
     bool benchmark = cutCheckCmdLineFlag(argc, (const char**) argv, "benchmark") != 0;
     cutGetCmdLineArgumenti( argc, (const char**) argv, "i", &numIterations);
-    
-    cudaInit(argc, argv);
-
+        
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_RGB | GLUT_DEPTH | GLUT_DOUBLE);
     glutInitWindowSize(640, 480);
@@ -586,8 +538,6 @@ main(int argc, char** argv)
 
     if (psystem)
         delete psystem;
-
-    cudaThreadExit();
 
     return 0;
 }

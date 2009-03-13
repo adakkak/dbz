@@ -28,6 +28,7 @@
  */
 
 #include <GL/glew.h>
+#include <GL/glut.h>
 
 #include <math.h>
 #include <assert.h>
@@ -123,7 +124,7 @@ void ParticleRenderer::display(DisplayMode mode /* = PARTICLE_POINTS */)
         glEnable(GL_DEPTH_TEST);
 
         glUseProgram(m_program);
-        glUniform1f( glGetUniformLocation(m_program, "pointScale"), m_window_h / tanf(m_fov*0.5f*(float)M_PI/180.0f) );
+        glUniform1f( glGetUniformLocation(m_program, "pointScale"), m_window_h / tan(m_fov*0.5*M_PI/180.0) );
         glUniform1f( glGetUniformLocation(m_program, "pointRadius"), m_particleRadius );
 
         glColor3f(1, 1, 1);
@@ -173,8 +174,6 @@ void ParticleRenderer::_initGL()
 {
     m_program = _compileProgram(vertexShader, spherePixelShader);
 
-#if !defined(__APPLE__) && !defined(MACOSX)
     glClampColorARB(GL_CLAMP_VERTEX_COLOR_ARB, GL_FALSE);
     glClampColorARB(GL_CLAMP_FRAGMENT_COLOR_ARB, GL_FALSE);
-#endif
 }
